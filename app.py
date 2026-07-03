@@ -1,8 +1,9 @@
 # ============================================================
 # Signal System V33 — Streamlit Web App
 #   - All original logic preserved
-#   - UI: ETF selection, volume threshold, run button
-#   - Displays comparison table, ETF charts, constituent charts
+#   - Added "Sector-Only" mode (skip constituent scanning)
+#   - UI: ETF selection, volume threshold, run mode, run button
+#   - Displays comparison table, ETF charts, constituent charts (if full mode)
 #   - Downloadable PDF and CSV reports
 # ============================================================
 
@@ -551,6 +552,15 @@ def run_full_analysis(etf_to_holdings, min_avg_volume):
 
 # ---------------- UI ----------------
 st.sidebar.header("Settings")
+
+# === NEW: Run mode selector ===
+run_mode = st.sidebar.radio(
+    "运行模式",
+    options=["完整分析（含成分股）", "仅 ETF 自身（Sector-Only）"],
+    index=0,
+    help="完整分析会扫描所有成分股（较耗时），Sector-Only 仅分析 11 只 ETF 自身"
+)
+
 all_etfs = SECTOR_ETF
 selected_etfs = st.sidebar.multiselect("Select Sector ETFs to analyze", all_etfs, default=all_etfs[:3])
 vol_thresholds = [0.01e6, 0.5e6, 1e6, 2e6, 5e6, 10e6]
@@ -567,68 +577,117 @@ if run_button:
     if not selected_etfs:
         st.warning("Please select at least one ETF.")
     else:
-        with st.spinner("Loading holdings data..."):
-            etf_to_holdings, holding_dates = get_holdings()
-        with st.spinner("Running analysis (this may take a few minutes)..."):
-            all_signals, etf_zone_stats_all, etf_self_data = run_full_analysis(etf_to_holdings, min_vol)
+        # Determine if we are in sector-only mode
+        sector_only = (run_mode == "仅 ETF 自身（Sector-Only）")
 
-        # Build results for selected ETFs
+        if sector_only:
+            st.info("⚡ Sector-Only 模式：仅分析 ETF 自身，跳过成分股扫描")
+            # No need to load holdings; create dummy structures
+            etf_to_holdings = {}
+            holding_dates = {}
+            all_signals = {}
+            etf_zone_stats_all = {}
+            
+            # Compute ETF self data for selected ETFs only
+            etf_self_data = {}
+            for etf in selected_etfs:
+                df = load_data(etf)
+                if df.empty or len(df) < max(120, VOLUME_LOOKBACK):
+                    st.warning(f"Not enough data for {etf}, skipping.")
+                    continue
+                poc, vah, val, _ = volume_profile_v6(df)
+                last = df["Close"].iloc[-1]
+                pct_above = ((last - vah) / vah * 100) if last > vah else 0.0
+                pct_below = ((val - last) / val * 100) if last < val else 0.0
+                etf_self_data[etf] = {
+                    'last': last, 'vah': vah, 'val': val,
+                    'pct_above': pct_above, 'pct_below': pct_below
+                }
+                # Empty zone stats (all zeros) for the comparison table
+                etf_zone_stats_all[etf] = {
+                    'Above VAH': {'count': 0, 'weight': 0.0},
+                    'Below VAL': {'count': 0, 'weight': 0.0},
+                    'Inside VA': {'count': 0, 'weight': 0.0}
+                }
+            # For ETFs not selected, we still need empty stats for the comparison table (which shows all 11)
+            for etf in SECTOR_ETF:
+                if etf not in etf_zone_stats_all:
+                    etf_zone_stats_all[etf] = {
+                        'Above VAH': {'count': 0, 'weight': 0.0},
+                        'Below VAL': {'count': 0, 'weight': 0.0},
+                        'Inside VA': {'count': 0, 'weight': 0.0}
+                    }
+                    # If self data missing, put zeros
+                    if etf not in etf_self_data:
+                        etf_self_data[etf] = {'pct_above': 0.0, 'pct_below': 0.0}
+        else:
+            # Full analysis mode
+            with st.spinner("Loading holdings data..."):
+                etf_to_holdings, holding_dates = get_holdings()
+            with st.spinner("Running analysis (this may take a few minutes)..."):
+                all_signals, etf_zone_stats_all, etf_self_data = run_full_analysis(etf_to_holdings, min_vol)
+
+        # ---------- Build results for selected ETFs ----------
+        # For sector-only, we have no constituent data, so skip breakout lists
         selected_ticker_weight = {}
-        for etf in selected_etfs:
-            for t, w in etf_to_holdings[etf].items():
-                selected_ticker_weight[t] = selected_ticker_weight.get(t, 0.0) + w
-
         results = []
         zone_entries = []
         breakout_above = []
         breakout_below = []
 
-        for ticker, data in all_signals.items():
-            if ticker not in selected_ticker_weight:
-                continue
-            if data['avg_vol'] < min_vol:
-                continue
-            res = data['signal']
-            last = data['last']
-            zone = data['zone']
-            weight = selected_ticker_weight[ticker]
-            results.append(res)
-            zone_entries.append({
-                "ticker": ticker, "asset_type": "Stock", "Last": last,
-                "VAH": res["VAH"], "VAL": res["VAL"],
-                "Pct_Above_VAH": res["Pct_Above_VAH"],
-                "Pct_Below_VAL": res["Pct_Below_VAL"],
-                "Weight": weight, "Avg_Vol": data['avg_vol'],
-                "zone_status": zone
-            })
-            pct_above = res["Pct_Above_VAH"]
-            pct_below = res["Pct_Below_VAL"]
-            if last > res["VAH"] and pct_above > BREAKOUT_THRESHOLD_PCT:
-                breakout_above.append((pct_above, ticker, None, res, zone, data['avg_vol'], weight))
-            elif last < res["VAL"] and pct_below > BREAKOUT_THRESHOLD_PCT:
-                breakout_below.append((pct_below, ticker, None, res, zone, data['avg_vol'], weight))
+        if not sector_only:
+            # Build weight map for selected ETFs
+            for etf in selected_etfs:
+                if etf in etf_to_holdings:
+                    for t, w in etf_to_holdings[etf].items():
+                        selected_ticker_weight[t] = selected_ticker_weight.get(t, 0.0) + w
 
-        breakout_above.sort(key=lambda x: x[0], reverse=True)
-        breakout_below.sort(key=lambda x: x[0], reverse=True)
+            for ticker, data in all_signals.items():
+                if ticker not in selected_ticker_weight:
+                    continue
+                if data['avg_vol'] < min_vol:
+                    continue
+                res = data['signal']
+                last = data['last']
+                zone = data['zone']
+                weight = selected_ticker_weight[ticker]
+                results.append(res)
+                zone_entries.append({
+                    "ticker": ticker, "asset_type": "Stock", "Last": last,
+                    "VAH": res["VAH"], "VAL": res["VAL"],
+                    "Pct_Above_VAH": res["Pct_Above_VAH"],
+                    "Pct_Below_VAL": res["Pct_Below_VAL"],
+                    "Weight": weight, "Avg_Vol": data['avg_vol'],
+                    "zone_status": zone
+                })
+                pct_above = res["Pct_Above_VAH"]
+                pct_below = res["Pct_Below_VAL"]
+                if last > res["VAH"] and pct_above > BREAKOUT_THRESHOLD_PCT:
+                    breakout_above.append((pct_above, ticker, None, res, zone, data['avg_vol'], weight))
+                elif last < res["VAL"] and pct_below > BREAKOUT_THRESHOLD_PCT:
+                    breakout_below.append((pct_below, ticker, None, res, zone, data['avg_vol'], weight))
 
-        # Load price data for breakout charts
-        for idx, (pct, ticker, _, res, zone, avg_vol, weight) in enumerate(breakout_above):
-            df = load_data(ticker)
-            breakout_above[idx] = (pct, ticker, df, res, zone, avg_vol, weight)
-        for idx, (pct, ticker, _, res, zone, avg_vol, weight) in enumerate(breakout_below):
-            df = load_data(ticker)
-            breakout_below[idx] = (pct, ticker, df, res, zone, avg_vol, weight)
+            breakout_above.sort(key=lambda x: x[0], reverse=True)
+            breakout_below.sort(key=lambda x: x[0], reverse=True)
+
+            # Load price data for breakout charts
+            for idx, (pct, ticker, _, res, zone, avg_vol, weight) in enumerate(breakout_above):
+                df = load_data(ticker)
+                breakout_above[idx] = (pct, ticker, df, res, zone, avg_vol, weight)
+            for idx, (pct, ticker, _, res, zone, avg_vol, weight) in enumerate(breakout_below):
+                df = load_data(ticker)
+                breakout_below[idx] = (pct, ticker, df, res, zone, avg_vol, weight)
 
         # ---------- Display Results ----------
         st.success("Analysis complete!")
 
-        # 1. Comparison Table
+        # 1. Comparison Table (always shown)
         st.subheader("📊 Sector Comparison Table")
-        comp_fig = create_sector_comparison_table(etf_zone_stats_all, etf_self_data, True, holding_dates)
+        comp_fig = create_sector_comparison_table(etf_zone_stats_all, etf_self_data, True, holding_dates if not sector_only else None)
         st.pyplot(comp_fig)
         plt.close(comp_fig)
 
-        # 2. ETF Charts
+        # 2. ETF Charts (always shown for selected ETFs)
         st.subheader("📈 ETF Charts")
         for etf in selected_etfs:
             df = load_data(etf)
@@ -657,15 +716,17 @@ if run_button:
             st.pyplot(fig)
             plt.close(fig)
 
-        # 3. Constituent Summary Pages
-        st.subheader("📋 ETF Constituent Zone Summaries")
-        for etf in selected_etfs:
-            fig = create_single_summary_page(etf_zone_stats_all[etf], etf, holding_dates.get(etf))
-            st.pyplot(fig)
-            plt.close(fig)
+        # 3. Constituent Summary Pages (only in full mode)
+        if not sector_only:
+            st.subheader("📋 ETF Constituent Zone Summaries")
+            for etf in selected_etfs:
+                if etf in etf_zone_stats_all:
+                    fig = create_single_summary_page(etf_zone_stats_all[etf], etf, holding_dates.get(etf) if not sector_only else None)
+                    st.pyplot(fig)
+                    plt.close(fig)
 
-        # 4. Breakout Charts (if any)
-        if breakout_above or breakout_below:
+        # 4. Breakout Charts (only in full mode)
+        if not sector_only and (breakout_above or breakout_below):
             st.subheader("🔍 Breakout Charts")
             for pct, ticker, df, res, zone, avg_vol, weight in breakout_above + breakout_below:
                 if df is None:
@@ -681,16 +742,17 @@ if run_button:
                 st.pyplot(fig)
                 plt.close(fig)
 
-        # 5. Download buttons
+        # ---------- Download buttons ----------
         st.subheader("📥 Download Reports")
 
         # Prepare PDF in memory
         pdf_buffer = io.BytesIO()
         with PdfPages(pdf_buffer) as pdf:
             # Comparison table
-            comp_fig = create_sector_comparison_table(etf_zone_stats_all, etf_self_data, True, holding_dates)
+            comp_fig = create_sector_comparison_table(etf_zone_stats_all, etf_self_data, True, holding_dates if not sector_only else None)
             pdf.savefig(comp_fig)
             plt.close(comp_fig)
+            
             # ETF charts
             for etf in selected_etfs:
                 df = load_data(etf)
@@ -718,25 +780,31 @@ if run_button:
                                            avg_vol=avg_vol, weight=None)
                 pdf.savefig(fig)
                 plt.close(fig)
-            # Constituent summaries
-            for etf in selected_etfs:
-                fig = create_single_summary_page(etf_zone_stats_all[etf], etf, holding_dates.get(etf))
-                pdf.savefig(fig)
-                plt.close(fig)
-            # Breakouts
-            for pct, ticker, df, res, zone, avg_vol, weight in breakout_above + breakout_below:
-                if df is None:
-                    continue
-                vp_data = volume_profile_plot_data(df)
-                obv_data = obv_plot_data(df)
-                if zone == 'Above VAH':
-                    fig = plot_ticker_analysis(ticker, df, vp_data, obv_data, "Stock", zone,
-                                               pct_above=pct, pct_below=0, avg_vol=avg_vol, weight=weight)
-                else:
-                    fig = plot_ticker_analysis(ticker, df, vp_data, obv_data, "Stock", zone,
-                                               pct_above=0, pct_below=pct, avg_vol=avg_vol, weight=weight)
-                pdf.savefig(fig)
-                plt.close(fig)
+            
+            # Constituent summaries (only in full mode)
+            if not sector_only:
+                for etf in selected_etfs:
+                    if etf in etf_zone_stats_all:
+                        fig = create_single_summary_page(etf_zone_stats_all[etf], etf, holding_dates.get(etf) if not sector_only else None)
+                        pdf.savefig(fig)
+                        plt.close(fig)
+            
+            # Breakouts (only in full mode)
+            if not sector_only:
+                for pct, ticker, df, res, zone, avg_vol, weight in breakout_above + breakout_below:
+                    if df is None:
+                        continue
+                    vp_data = volume_profile_plot_data(df)
+                    obv_data = obv_plot_data(df)
+                    if zone == 'Above VAH':
+                        fig = plot_ticker_analysis(ticker, df, vp_data, obv_data, "Stock", zone,
+                                                   pct_above=pct, pct_below=0, avg_vol=avg_vol, weight=weight)
+                    else:
+                        fig = plot_ticker_analysis(ticker, df, vp_data, obv_data, "Stock", zone,
+                                                   pct_above=0, pct_below=pct, avg_vol=avg_vol, weight=weight)
+                    pdf.savefig(fig)
+                    plt.close(fig)
+        
         pdf_buffer.seek(0)
         st.download_button(
             label="📄 Download Full PDF Report",
@@ -745,26 +813,50 @@ if run_button:
             mime="application/pdf"
         )
 
-        # CSV downloads
-        if results:
-            signal_df = pd.DataFrame(results)
-            signal_df['weight'] = signal_df['ticker'].map(selected_ticker_weight).fillna(0.0)
-            csv_signal = signal_df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="📥 Download Signal CSV",
-                data=csv_signal,
-                file_name=f"signals_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv"
-            )
-        if zone_entries:
-            zone_df = pd.DataFrame(zone_entries)
-            zone_df["sort_pct"] = zone_df.apply(lambda row: row["Pct_Above_VAH"] if row["zone_status"] == "Above VAH"
-                                                else (row["Pct_Below_VAL"] if row["zone_status"] == "Below VAL" else 0), axis=1)
-            zone_df_sorted = zone_df.sort_values(["zone_status", "sort_pct"], ascending=[True, False]).drop(columns="sort_pct")
-            csv_zone = zone_df_sorted.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="📥 Download Zone CSV",
-                data=csv_zone,
-                file_name=f"zones_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                mime="text/csv"
-            )
+        # CSV downloads (only in full mode)
+        if not sector_only:
+            if results:
+                signal_df = pd.DataFrame(results)
+                signal_df['weight'] = signal_df['ticker'].map(selected_ticker_weight).fillna(0.0)
+                csv_signal = signal_df.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label="📥 Download Signal CSV",
+                    data=csv_signal,
+                    file_name=f"signals_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv"
+                )
+            if zone_entries:
+                zone_df = pd.DataFrame(zone_entries)
+                zone_df["sort_pct"] = zone_df.apply(lambda row: row["Pct_Above_VAH"] if row["zone_status"] == "Above VAH"
+                                                    else (row["Pct_Below_VAL"] if row["zone_status"] == "Below VAL" else 0), axis=1)
+                zone_df_sorted = zone_df.sort_values(["zone_status", "sort_pct"], ascending=[True, False]).drop(columns="sort_pct")
+                csv_zone = zone_df_sorted.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label="📥 Download Zone CSV",
+                    data=csv_zone,
+                    file_name=f"zones_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv"
+                )
+        else:
+            # In sector-only mode, we can still generate a CSV of ETF self positions
+            etf_csv_data = []
+            for etf in selected_etfs:
+                if etf in etf_self_data:
+                    d = etf_self_data[etf]
+                    etf_csv_data.append({
+                        "ticker": etf,
+                        "Last": d.get('last', np.nan),
+                        "VAH": d.get('vah', np.nan),
+                        "VAL": d.get('val', np.nan),
+                        "Pct_Above_VAH": d.get('pct_above', 0.0),
+                        "Pct_Below_VAL": d.get('pct_below', 0.0)
+                    })
+            if etf_csv_data:
+                etf_df = pd.DataFrame(etf_csv_data)
+                csv_etf = etf_df.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label="📥 Download ETF Self CSV",
+                    data=csv_etf,
+                    file_name=f"etf_self_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv"
+                )
